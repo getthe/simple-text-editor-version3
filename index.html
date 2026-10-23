@@ -2127,6 +2127,20 @@
     scheduleSystemFontsBuild();
   })();
 
+  // One-time cleanup: earlier versions mirrored every installed face into
+  // IndexedDB. Nothing reads that catalog any more, so reclaim the space.
+  (function dropLegacyFontDb() {
+    var DONE_KEY = 'simpleEditor.fontdbCleared';
+    try { if (localStorage.getItem(DONE_KEY)) return; } catch (e) { return; }
+    try {
+      var req = indexedDB.deleteDatabase('simpleEditor.fontdb');
+      req.onsuccess = req.onerror = function () {
+        try { localStorage.setItem(DONE_KEY, '1'); } catch (e) {}
+      };
+      // blocked = an older tab still holds it open; retry on the next launch
+    } catch (e) { /* no IndexedDB here — nothing to clean up */ }
+  })();
+
   editor.focus();
 })();
 </script>
