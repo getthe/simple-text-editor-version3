@@ -214,6 +214,106 @@
     margin-top: 8px;
   }
 
+  /* ---------- Find & Replace panel ---------- */
+  .find-panel {
+    position: fixed;
+    z-index: 120;
+    top: 64px;
+    right: 18px;
+    width: 340px;
+    background: var(--toolbar-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .find-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+
+  .find-close {
+    border: none;
+    background: none;
+    color: var(--muted);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+  }
+
+  .find-close:hover { color: var(--accent); }
+
+  .find-row { display: flex; gap: 6px; align-items: center; }
+
+  .find-panel input[type="text"] {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--editor-bg);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 6px 9px;
+  }
+
+  .find-panel input[type="text"]:focus { outline: none; border-color: var(--accent); }
+
+  .find-count { font-size: 11.5px; color: var(--muted); white-space: nowrap; min-width: 34px; text-align: center; }
+
+  .find-nav-btn, .find-act-btn {
+    font: inherit;
+    font-size: 12.5px;
+    color: var(--text);
+    background: var(--editor-bg);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 5px 9px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .find-nav-btn:hover, .find-act-btn:hover { border-color: var(--accent); }
+
+  .find-act-btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+    font-weight: 600;
+  }
+
+  .find-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+
+  .find-meta label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+
+  mark.find-hl {
+    background: color-mix(in srgb, #f59e0b 42%, transparent);
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
+  }
+
+  mark.find-hl.active {
+    background: #f59e0b;
+    color: #1e2229;
+    box-shadow: 0 0 0 2px color-mix(in srgb, #f59e0b 55%, transparent);
+  }
+
   .align-btn svg { display: block; }
   .align-btn:hover svg line { stroke: var(--accent); }
 
@@ -484,7 +584,7 @@
 
   /* ---------- Print: only the document, on paper-friendly styling ---------- */
   @media print {
-    .toolbar, .statusbar, .color-panel, .loading-ind { display: none !important; }
+    .toolbar, .statusbar, .color-panel, .loading-ind, .find-panel { display: none !important; }
 
     body {
       display: block;
@@ -509,7 +609,7 @@
     body.dark .editor { color: #000000; }
 
     /* Search highlights are screen-only aids */
-    mark.word-hl {
+    mark.word-hl, mark.find-hl {
       background: transparent !important;
       color: inherit !important;
       animation: none !important;
@@ -600,6 +700,7 @@
       ⊞ Panes <span class="count" id="panesCount">1</span>
     </button>
 
+    <button class="download-btn" id="findBtn" title="Find & Replace (Ctrl+F)">🔍 Find</button>
     <button class="download-btn" id="printBtn" title="Print the document (Ctrl+P)">🖨 Print</button>
     <button class="download-btn" id="saveBtn" title="Save with the file dialog (HTML keeps all formatting)">💾 Save As</button>
     <button class="download-btn" id="resetBtn" title="Clear the document and restore default font, size and panes">⟲ Reset</button>
@@ -636,6 +737,29 @@
       <button class="apply-btn" id="colorApplyBtn">Apply</button>
     </div>
     <div class="panel-hint" id="panelHint" hidden>Select some text first, then click Apply.</div>
+  </div>
+
+  <!-- Find & Replace panel -->
+  <div class="find-panel" id="findPanel" hidden>
+    <div class="find-head">
+      <span>Find &amp; Replace</span>
+      <button class="find-close" id="findClose" title="Close (Esc)">&times;</button>
+    </div>
+    <div class="find-row">
+      <input type="text" id="findInput" placeholder="Find…" autocomplete="off" spellcheck="false">
+      <span class="find-count" id="findCount">0/0</span>
+      <button class="find-nav-btn" id="findPrev" title="Previous (Shift+Enter)">▲</button>
+      <button class="find-nav-btn" id="findNext" title="Next (Enter)">▼</button>
+    </div>
+    <div class="find-row">
+      <input type="text" id="replaceInput" placeholder="Replace with…" autocomplete="off" spellcheck="false">
+      <button class="find-act-btn" id="replaceBtn" title="Replace the current match">Replace</button>
+      <button class="find-act-btn primary" id="replaceAllBtn" title="Replace every match">All</button>
+    </div>
+    <div class="find-meta">
+      <label><input type="checkbox" id="findCase"> Match case</label>
+      <span>Enter = next · Shift+Enter = prev</span>
+    </div>
   </div>
 
 <script>
@@ -740,7 +864,7 @@
     clearTimeout(saveTimer);
     saveTimer = setTimeout(function () {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
-        html: editor.innerHTML,
+        html: cleanEditorHtml(), // strip transient Find highlights before persisting
         font: defaultFont,
         size: defaultSize,
         panes: panes,
@@ -1299,7 +1423,7 @@
   function buildHtmlExport() {
     return '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n<title>Document</title>\n'
       + '<style>body{font-family:' + defaultFont + ';font-size:' + defaultSize + 'px;line-height:1.65;margin:40px auto;max-width:720px;}</style>\n'
-      + '</head>\n<body>\n' + editor.innerHTML + '\n</body>\n</html>';
+      + '</head>\n<body>\n' + cleanEditorHtml() + '\n</body>\n</html>';
   }
 
   // ---- Print: native print dialog, print CSS shows only the document ----
@@ -1385,7 +1509,7 @@
     download('document.html', buildHtmlExport(), 'text/html;charset=utf-8');
   });
 
-  // Keyboard shortcut: Ctrl+Shift+D toggles theme
+  // Keyboard shortcuts: Ctrl+Shift+D theme · Ctrl+S save · Ctrl+F find
   document.addEventListener('keydown', function (e) {
     if (e.ctrlKey && e.shiftKey && e.code === 'KeyD') {
       e.preventDefault();
@@ -1395,7 +1519,14 @@
       e.preventDefault(); // replace the browser's Save-page dialog with ours
       document.getElementById('saveBtn').click();
     }
-    if (e.key === 'Escape') clearHighlight();
+    if ((e.ctrlKey || e.metaKey) && e.code === 'KeyF' && !e.shiftKey) {
+      e.preventDefault(); // replace the browser's Find bar with ours
+      openFind();
+    }
+    if (e.key === 'Escape') {
+      if (!findPanel.hidden) closeFind();
+      else clearHighlight();
+    }
   });
 
   // ---- Mouse-wheel zoom over the editor ----
@@ -1489,6 +1620,175 @@
 
   // A plain click removes any active word highlight
   editor.addEventListener('click', clearHighlight);
+
+  // ---- Find & Replace ----
+  var findBtn        = document.getElementById('findBtn');
+  var findPanel      = document.getElementById('findPanel');
+  var findInput      = document.getElementById('findInput');
+  var replaceInput   = document.getElementById('replaceInput');
+  var findCountEl    = document.getElementById('findCount');
+  var findCase       = document.getElementById('findCase');
+  var findPrevBtn    = document.getElementById('findPrev');
+  var findNextBtn    = document.getElementById('findNext');
+  var replaceBtn     = document.getElementById('replaceBtn');
+  var replaceAllBtn  = document.getElementById('replaceAllBtn');
+  var findCloseBtn   = document.getElementById('findClose');
+  var findMatches = []; // mark.find-hl elements, in document order
+  var findIndex = -1;
+
+  // Return editor HTML with any transient Find highlights unwrapped, so they
+  // never leak into localStorage or exported files.
+  function cleanEditorHtml() {
+    if (!editor.querySelector('mark.find-hl')) return editor.innerHTML;
+    var clone = editor.cloneNode(true);
+    Array.prototype.forEach.call(clone.querySelectorAll('mark.find-hl'), function (m) {
+      var p = m.parentNode;
+      while (m.firstChild) p.insertBefore(m.firstChild, m);
+      p.removeChild(m);
+    });
+    return clone.innerHTML;
+  }
+
+  function clearFindMarks() {
+    var marks = editor.querySelectorAll('mark.find-hl');
+    if (!marks.length) return;
+    Array.prototype.forEach.call(marks, function (m) {
+      var p = m.parentNode;
+      while (m.firstChild) p.insertBefore(m.firstChild, m);
+      p.removeChild(m);
+    });
+    editor.normalize();
+  }
+
+  function runFind(scroll) {
+    clearFindMarks();
+    findMatches = [];
+    findIndex = -1;
+    var q = findInput.value;
+    if (!q) { updateFindCount(); return; }
+    var re = new RegExp(escapeRegExp(q), findCase.checked ? 'g' : 'gi');
+    var nodes = [];
+    var walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null, false);
+    var node;
+    while ((node = walker.nextNode())) { if (node.nodeValue) nodes.push(node); }
+    nodes.forEach(function (tn) {
+      var text = tn.nodeValue, m, spans = [];
+      re.lastIndex = 0;
+      while ((m = re.exec(text)) !== null) {
+        if (!m[0].length) { re.lastIndex++; continue; }
+        spans.push({ start: m.index, len: m[0].length });
+      }
+      // wrap last-to-first so earlier offsets within this node stay valid
+      for (var i = spans.length - 1; i >= 0; i--) {
+        var mark = document.createElement('mark');
+        mark.className = 'find-hl';
+        var r = document.createRange();
+        r.setStart(tn, spans[i].start);
+        r.setEnd(tn, spans[i].start + spans[i].len);
+        r.surroundContents(mark);
+        findMatches.unshift(mark);
+      }
+    });
+    if (findMatches.length) {
+      findIndex = 0;
+      setActiveFind();
+      if (scroll !== false) scrollActiveFind();
+    }
+    updateFindCount();
+  }
+
+  function updateFindCount() {
+    var t = findMatches.length;
+    findCountEl.textContent = t ? (findIndex + 1) + '/' + t : '0/0';
+  }
+
+  function setActiveFind() {
+    Array.prototype.forEach.call(editor.querySelectorAll('mark.find-hl'), function (m) {
+      m.classList.remove('active');
+    });
+    if (findMatches[findIndex]) findMatches[findIndex].classList.add('active');
+  }
+
+  function scrollActiveFind() {
+    var el = findMatches[findIndex];
+    if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
+  function gotoFind(step) {
+    if (!findMatches.length) { runFind(true); return; }
+    findIndex = (findIndex + step + findMatches.length) % findMatches.length;
+    setActiveFind();
+    scrollActiveFind();
+    updateFindCount();
+  }
+
+  function replaceCurrent() {
+    if (!findMatches.length) return;
+    var el = findMatches[findIndex] || findMatches[0];
+    el.parentNode.replaceChild(document.createTextNode(replaceInput.value), el);
+    editor.normalize();
+    var keep = findIndex;
+    runFind(true);
+    if (findMatches.length) {
+      findIndex = Math.min(keep, findMatches.length - 1);
+      setActiveFind(); scrollActiveFind(); updateFindCount();
+    }
+    save();
+  }
+
+  function replaceAll() {
+    var q = findInput.value;
+    if (!q) return;
+    var n = findMatches.length;
+    clearFindMarks();
+    var re = new RegExp(escapeRegExp(q), findCase.checked ? 'g' : 'gi');
+    var walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null, false);
+    var nodes = [], node;
+    while ((node = walker.nextNode())) nodes.push(node);
+    nodes.forEach(function (tn) {
+      if (!tn.nodeValue) return;
+      var nt = tn.nodeValue.replace(re, replaceInput.value);
+      if (nt !== tn.nodeValue) tn.nodeValue = nt;
+    });
+    editor.normalize();
+    runFind(true);
+    save();
+    status.textContent = 'Replaced ' + n;
+    setTimeout(function () { status.textContent = 'Saved'; }, 2000);
+  }
+
+  function openFind() {
+    findPanel.hidden = false;
+    findInput.focus();
+    findInput.select();
+    runFind(true);
+  }
+
+  function closeFind() {
+    clearFindMarks();
+    findMatches = []; findIndex = -1;
+    findPanel.hidden = true;
+    editor.focus();
+  }
+
+  findBtn.addEventListener('click', function () { if (findPanel.hidden) openFind(); else closeFind(); });
+  findCloseBtn.addEventListener('click', closeFind);
+  var findDebounce = null;
+  findInput.addEventListener('input', function () {
+    clearTimeout(findDebounce);
+    findDebounce = setTimeout(function () { runFind(true); }, 180);
+  });
+  findInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); gotoFind(e.shiftKey ? -1 : 1); }
+  });
+  replaceInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); replaceAll(); }
+  });
+  findCase.addEventListener('change', function () { runFind(true); });
+  findPrevBtn.addEventListener('click', function () { gotoFind(-1); });
+  findNextBtn.addEventListener('click', function () { gotoFind(1); });
+  replaceBtn.addEventListener('click', replaceCurrent);
+  replaceAllBtn.addEventListener('click', replaceAll);
 
   load();
 
