@@ -231,6 +231,9 @@
     gap: 8px;
   }
 
+  /* display:flex would otherwise beat the UA [hidden] rule and leave the panel on screen */
+  .find-panel[hidden] { display: none; }
+
   .find-head {
     display: flex;
     align-items: center;
@@ -294,12 +297,26 @@
   .find-meta {
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 4px 12px;
     font-size: 11.5px;
     color: var(--muted);
   }
 
   .find-meta label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+
+  .find-meta input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+
+  .find-count.empty { opacity: .65; }
+
+  .find-count.error { color: #e11d48; }
+
+  .find-hint {
+    font-size: 11px;
+    color: var(--muted);
+    line-height: 1.35;
+    min-height: 15px;
+  }
 
   mark.find-hl {
     background: color-mix(in srgb, #f59e0b 42%, transparent);
@@ -700,7 +717,7 @@
       ⊞ Panes <span class="count" id="panesCount">1</span>
     </button>
 
-    <button class="download-btn" id="findBtn" title="Find & Replace (Ctrl+F)">🔍 Find</button>
+    <button class="download-btn" id="findBtn" title="Find &amp; Replace (Ctrl+F · Ctrl+H)">🔍 Find</button>
     <button class="download-btn" id="printBtn" title="Print the document (Ctrl+P)">🖨 Print</button>
     <button class="download-btn" id="saveBtn" title="Save with the file dialog (HTML keeps all formatting)">💾 Save As</button>
     <button class="download-btn" id="resetBtn" title="Clear the document and restore default font, size and panes">⟲ Reset</button>
@@ -748,18 +765,21 @@
     <div class="find-row">
       <input type="text" id="findInput" placeholder="Find…" autocomplete="off" spellcheck="false">
       <span class="find-count" id="findCount">0/0</span>
-      <button class="find-nav-btn" id="findPrev" title="Previous (Shift+Enter)">▲</button>
-      <button class="find-nav-btn" id="findNext" title="Next (Enter)">▼</button>
+      <button class="find-nav-btn" id="findPrev" title="Previous (Shift+Enter / Shift+F3)">▲</button>
+      <button class="find-nav-btn" id="findNext" title="Next (Enter / F3)">▼</button>
     </div>
     <div class="find-row">
       <input type="text" id="replaceInput" placeholder="Replace with…" autocomplete="off" spellcheck="false">
-      <button class="find-act-btn" id="replaceBtn" title="Replace the current match">Replace</button>
-      <button class="find-act-btn primary" id="replaceAllBtn" title="Replace every match">All</button>
+      <button class="find-act-btn" id="replaceBtn" title="Replace the current match (Enter)">Replace</button>
+      <button class="find-act-btn primary" id="replaceAllBtn" title="Replace every match (Ctrl+Enter)">All</button>
     </div>
     <div class="find-meta">
       <label><input type="checkbox" id="findCase"> Match case</label>
-      <span>Enter = next · Shift+Enter = prev</span>
+      <label><input type="checkbox" id="findWord"> Whole word</label>
+      <label><input type="checkbox" id="findRegex" title="Treat the search text as a regular expression"> Regex</label>
+      <label><input type="checkbox" id="findScope" title="Limit Find &amp; Replace to the text selected when this panel opened"> Selection only</label>
     </div>
+    <div class="find-hint" id="findHint">Enter = next · Shift+Enter = prev · Ctrl+Enter = replace all</div>
   </div>
 
 <script>
@@ -1523,6 +1543,14 @@
       e.preventDefault(); // replace the browser's Find bar with ours
       openFind();
     }
+    if ((e.ctrlKey || e.metaKey) && e.code === 'KeyH') {
+      e.preventDefault(); // open with the Replace field focused
+      openFind(true);
+    }
+    if (e.key === 'F3' && !findPanel.hidden) {
+      e.preventDefault(); // F3 / Shift+F3 step through matches
+      gotoFind(e.shiftKey ? -1 : 1);
+    }
     if (e.key === 'Escape') {
       if (!findPanel.hidden) closeFind();
       else clearHighlight();
@@ -1628,13 +1656,38 @@
   var replaceInput   = document.getElementById('replaceInput');
   var findCountEl    = document.getElementById('findCount');
   var findCase       = document.getElementById('findCase');
+  var findWord       = document.getElementById('findWord');
+  var findRegex      = document.getElementById('findRegex');
+  var findScope      = document.getElementById('findScope');
+  var findHint       = document.getElementById('findHint');
   var findPrevBtn    = document.getElementById('findPrev');
   var findNextBtn    = document.getElementById('findNext');
   var replaceBtn     = document.getElementById('replaceBtn');
   var replaceAllBtn  = document.getElementById('replaceAllBtn');
   var findCloseBtn   = document.getElementById('findClose');
-  var findMatches = []; // mark.find-hl elements, in document order
+  var findMatches = [];      // { el, start } in document order
   var findIndex = -1;
+  var findAnchor = null;     // caret offset captured when the panel opened
+  var findScopeRange = null; // { start, end } offsets of the editor selection
+  var FIND_HINT = 'Enter = next · Shift+Enter = prev · Ctrl+Enter = replace all';
+
+  var findHintTimer = null;
+  function showFindHint(text) {
+    clearTimeout(findHintTimer);
+    findHintTimer = null;
+    findHint.textContent = text || (findScope.checked
+      ? 'Only inside the selection captured when the panel opened'
+      : FIND_HINT);
+  }
+
+  // Show a transient message without letting an older timer wipe it early
+  function flashFindHint(text, ms) {
+    showFindHint(text);
+    findHintTimer = setTimeout(function () {
+      findHintTimer = null;
+      showFindHint();
+    }, ms);
+  }
 
   // Return editor HTML with any transient Find highlights unwrapped, so they
   // never leak into localStorage or exported files.
@@ -1660,37 +1713,139 @@
     editor.normalize();
   }
 
-  function runFind(scroll) {
+  // Text nodes with their absolute character offset inside the editor.
+  function collectTextNodes() {
+    var walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null, false);
+    var list = [], node, pos = 0;
+    while ((node = walker.nextNode())) {
+      var len = node.nodeValue ? node.nodeValue.length : 0;
+      if (len) {
+        list.push({ node: node, start: pos });
+        pos += len;
+      }
+    }
+    return list;
+  }
+
+  function editorOffset(node, offset) {
+    var r = document.createRange();
+    r.selectNodeContents(editor);
+    r.setEnd(node, offset);
+    return r.toString().length;
+  }
+
+  function editorSelectionOffsets() {
+    var sel = window.getSelection();
+    if (!sel || !sel.rangeCount) return null;
+    var r = sel.getRangeAt(0);
+    if (!editor.contains(r.commonAncestorContainer)) return null;
+    return {
+      collapsed: r.collapsed,
+      start: editorOffset(r.startContainer, r.startOffset),
+      end: r.collapsed ? null : editorOffset(r.endContainer, r.endOffset),
+      text: sel.toString()
+    };
+  }
+
+  // Put a collapsed caret back at an absolute editor offset. Re-wrapping the
+  // find highlights can merge text nodes, which loses the browser's caret.
+  function setEditorCaret(absOffset) {
+    var nodes = collectTextNodes();
+    for (var i = 0; i < nodes.length; i++) {
+      var len = nodes[i].node.nodeValue.length;
+      if (absOffset <= nodes[i].start + len) {
+        var r = document.createRange();
+        r.setStart(nodes[i].node, Math.max(0, absOffset - nodes[i].start));
+        r.collapse(true);
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(r);
+        return;
+      }
+    }
+  }
+
+  function isWholeWordMatch(text, index, len) {
+    var before = index > 0 ? text.charAt(index - 1) : '';
+    var after = index + len < text.length ? text.charAt(index + len) : '';
+    return !/\w/.test(before) && !/\w/.test(after);
+  }
+
+  // Returns { re, literal } or { error }; Regex mode reports a bad pattern
+  // instead of throwing while the user is still typing it.
+  function buildFindPattern() {
+    var q = findInput.value;
+    if (!q) return null;
+    var flags = 'g' + (findCase.checked ? '' : 'i');
+    if (findRegex.checked) {
+      try {
+        return { re: new RegExp(q, flags), literal: false };
+      } catch (err) {
+        return { error: true };
+      }
+    }
+    return { re: new RegExp(escapeRegExp(q), flags), literal: true };
+  }
+
+  function scopeOf() {
+    return findScope.checked ? findScopeRange : null;
+  }
+
+  // Matching spans inside one text node, honouring whole word and scope.
+  function findSpansIn(text, pat, scope, base) {
+    var spans = [], m;
+    var re = pat.re;
+    re.lastIndex = 0;
+    while ((m = re.exec(text)) !== null) {
+      if (!m[0].length) { re.lastIndex++; continue; }
+      if (findWord.checked && pat.literal && !isWholeWordMatch(text, m.index, m[0].length)) continue;
+      var absStart = base + m.index;
+      var absEnd = absStart + m[0].length;
+      if (scope && (absStart < scope.start || absEnd > scope.end)) continue;
+      spans.push({ index: m.index, len: m[0].length, abs: absStart });
+    }
+    return spans;
+  }
+
+  function runFind(scroll, fromOffset) {
     clearFindMarks();
     findMatches = [];
     findIndex = -1;
-    var q = findInput.value;
-    if (!q) { updateFindCount(); return; }
-    var re = new RegExp(escapeRegExp(q), findCase.checked ? 'g' : 'gi');
-    var nodes = [];
-    var walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null, false);
-    var node;
-    while ((node = walker.nextNode())) { if (node.nodeValue) nodes.push(node); }
-    nodes.forEach(function (tn) {
-      var text = tn.nodeValue, m, spans = [];
-      re.lastIndex = 0;
-      while ((m = re.exec(text)) !== null) {
-        if (!m[0].length) { re.lastIndex++; continue; }
-        spans.push({ start: m.index, len: m[0].length });
-      }
-      // wrap last-to-first so earlier offsets within this node stay valid
+    findCountEl.classList.remove('empty', 'error');
+
+    if (!findInput.value) { updateFindCount(); return; }
+
+    var pat = buildFindPattern();
+    if (!pat || pat.error) {
+      findCountEl.textContent = '—';
+      findCountEl.classList.add('error');
+      return;
+    }
+
+    var scope = scopeOf();
+    collectTextNodes().forEach(function (info) {
+      var text = info.node.nodeValue;
+      var spans = findSpansIn(text, pat, scope, info.start);
+      // Wrap last-to-first so earlier offsets in this node stay valid
       for (var i = spans.length - 1; i >= 0; i--) {
         var mark = document.createElement('mark');
         mark.className = 'find-hl';
         var r = document.createRange();
-        r.setStart(tn, spans[i].start);
-        r.setEnd(tn, spans[i].start + spans[i].len);
+        r.setStart(info.node, spans[i].index);
+        r.setEnd(info.node, spans[i].index + spans[i].len);
         r.surroundContents(mark);
-        findMatches.unshift(mark);
+        findMatches.unshift({ el: mark, start: spans[i].abs });
       }
     });
+
     if (findMatches.length) {
+      var anchor = (typeof fromOffset === 'number') ? fromOffset : findAnchor;
       findIndex = 0;
+      if (typeof anchor === 'number') {
+        for (var j = 0; j < findMatches.length; j++) {
+          if (findMatches[j].start >= anchor) { findIndex = j; break; }
+        }
+      }
       setActiveFind();
       if (scroll !== false) scrollActiveFind();
     }
@@ -1698,20 +1853,28 @@
   }
 
   function updateFindCount() {
-    var t = findMatches.length;
-    findCountEl.textContent = t ? (findIndex + 1) + '/' + t : '0/0';
+    var total = findMatches.length;
+    if (!findInput.value) {
+      findCountEl.textContent = '—';
+      findCountEl.classList.add('empty');
+    } else if (!total) {
+      findCountEl.textContent = '0/0';
+      findCountEl.classList.add('empty');
+    } else {
+      findCountEl.textContent = (findIndex + 1) + '/' + total;
+    }
   }
 
   function setActiveFind() {
-    Array.prototype.forEach.call(editor.querySelectorAll('mark.find-hl'), function (m) {
-      m.classList.remove('active');
-    });
-    if (findMatches[findIndex]) findMatches[findIndex].classList.add('active');
+    findMatches.forEach(function (m) { m.el.classList.remove('active'); });
+    if (findMatches[findIndex]) findMatches[findIndex].el.classList.add('active');
   }
 
   function scrollActiveFind() {
-    var el = findMatches[findIndex];
-    if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    var match = findMatches[findIndex];
+    if (match && match.el.scrollIntoView) {
+      match.el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
   }
 
   function gotoFind(step) {
@@ -1724,44 +1887,114 @@
 
   function replaceCurrent() {
     if (!findMatches.length) return;
-    var el = findMatches[findIndex] || findMatches[0];
-    el.parentNode.replaceChild(document.createTextNode(replaceInput.value), el);
-    editor.normalize();
-    var keep = findIndex;
-    runFind(true);
-    if (findMatches.length) {
-      findIndex = Math.min(keep, findMatches.length - 1);
-      setActiveFind(); scrollActiveFind(); updateFindCount();
+    var cur = findMatches[findIndex] || findMatches[0];
+    var parent = cur.el.parentNode;
+    if (!parent) return;
+
+    var replacement = replaceInput.value;
+    var replacedLen = cur.el.textContent.length;
+    parent.replaceChild(document.createTextNode(replacement), cur.el);
+    parent.normalize();
+
+    // Keep the captured scope aligned with the edited text
+    var scopeShift = replacement.length - replacedLen;
+    if (findScopeRange) {
+      if (cur.start < findScopeRange.start) {
+        findScopeRange.start += scopeShift;
+        findScopeRange.end += scopeShift;
+      } else if (cur.start < findScopeRange.end) {
+        findScopeRange.end += scopeShift;
+      }
     }
+
     save();
+    runFind(true, cur.start);
+    flashFindHint('Replaced 1', 1800);
   }
 
   function replaceAll() {
-    var q = findInput.value;
-    if (!q) return;
-    var n = findMatches.length;
+    if (!findInput.value) return;
+    var pat = buildFindPattern();
+    if (!pat || pat.error) {
+      findCountEl.textContent = '—';
+      findCountEl.classList.add('error');
+      showFindHint('Invalid regular expression');
+      return;
+    }
+
     clearFindMarks();
-    var re = new RegExp(escapeRegExp(q), findCase.checked ? 'g' : 'gi');
-    var walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null, false);
-    var nodes = [], node;
-    while ((node = walker.nextNode())) nodes.push(node);
-    nodes.forEach(function (tn) {
-      if (!tn.nodeValue) return;
-      var nt = tn.nodeValue.replace(re, replaceInput.value);
-      if (nt !== tn.nodeValue) tn.nodeValue = nt;
+    var scope = scopeOf();
+    var replacement = replaceInput.value;
+    var plans = [];
+    var total = 0;
+    var deltaBeforeScope = 0;
+    var deltaInsideScope = 0;
+
+    // Pass 1: locate everything against the unmodified text, so the scope
+    // offsets stay valid while replacements change the document length
+    collectTextNodes().forEach(function (info) {
+      var text = info.node.nodeValue;
+      var spans = findSpansIn(text, pat, scope, info.start);
+      if (!spans.length) return;
+
+      var out = '', last = 0;
+      spans.forEach(function (s) {
+        out += text.slice(last, s.index) + replacement;
+        last = s.index + s.len;
+        var shift = replacement.length - s.len;
+        if (findScopeRange && s.abs < findScopeRange.start) deltaBeforeScope += shift;
+        else if (findScopeRange && s.abs < findScopeRange.end) deltaInsideScope += shift;
+      });
+      out += text.slice(last);
+      plans.push({ node: info.node, value: out });
+      total += spans.length;
     });
+
+    // Pass 2: apply
+    plans.forEach(function (p) { p.node.nodeValue = p.value; });
     editor.normalize();
-    runFind(true);
+
+    if (findScopeRange) {
+      findScopeRange.start += deltaBeforeScope;
+      findScopeRange.end += deltaBeforeScope + deltaInsideScope;
+    }
+
     save();
-    status.textContent = 'Replaced ' + n;
-    setTimeout(function () { status.textContent = 'Saved'; }, 2000);
+    runFind(true, scope ? scope.start : undefined);
+
+    if (total) {
+      flashFindHint('Replaced ' + total + (scope ? ' in selection' : ''), 2200);
+    } else {
+      flashFindHint('Nothing to replace', 1800);
+    }
   }
 
-  function openFind() {
+  function openFind(focusReplace) {
+    // Capture the editor selection before highlighting mutates the DOM.
+    // Re-opening while the panel is up keeps the earlier anchor and scope
+    // when the selection is not inside the editor (e.g. focus in the input),
+    // but a fresh open always re-captures, so offsets never go stale.
+    var wasOpen = !findPanel.hidden;
+    var sel = editorSelectionOffsets();
+    if (sel) {
+      findAnchor = sel.start;
+      if (!sel.collapsed) {
+        findScopeRange = { start: sel.start, end: sel.end };
+        var snippet = sel.text.replace(/\s+/g, ' ').trim();
+        if (snippet && snippet.length <= 120) findInput.value = snippet;
+      }
+    } else if (!wasOpen) {
+      findAnchor = null;
+      findScopeRange = null;
+    }
+    if (!findScopeRange) findScope.checked = false;
+
     findPanel.hidden = false;
-    findInput.focus();
-    findInput.select();
     runFind(true);
+    var target = focusReplace ? replaceInput : findInput;
+    target.focus();
+    target.select();
+    showFindHint();
   }
 
   function closeFind() {
@@ -1773,6 +2006,23 @@
 
   findBtn.addEventListener('click', function () { if (findPanel.hidden) openFind(); else closeFind(); });
   findCloseBtn.addEventListener('click', closeFind);
+
+  // Keep the highlights honest when the document is edited while the panel
+  // is open; the caret is restored so typing is not interrupted
+  var findEditCaret = null;
+  var findLiveTimer = null;
+  editor.addEventListener('input', function (e) {
+    if (findPanel.hidden || !findInput.value || (e && e.isComposing)) return;
+    var sel = editorSelectionOffsets();
+    findEditCaret = sel ? sel.start : null;
+    clearTimeout(findLiveTimer);
+    findLiveTimer = setTimeout(function () {
+      var caret = findEditCaret;
+      runFind(false, caret == null ? undefined : caret);
+      if (caret != null && document.activeElement === editor) setEditorCaret(caret);
+    }, 260);
+  });
+
   var findDebounce = null;
   findInput.addEventListener('input', function () {
     clearTimeout(findDebounce);
@@ -1782,9 +2032,29 @@
     if (e.key === 'Enter') { e.preventDefault(); gotoFind(e.shiftKey ? -1 : 1); }
   });
   replaceInput.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') { e.preventDefault(); replaceAll(); }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (e.ctrlKey || e.metaKey) replaceAll();
+      else replaceCurrent();
+    }
   });
   findCase.addEventListener('change', function () { runFind(true); });
+  findWord.addEventListener('change', function () { runFind(true); });
+  findRegex.addEventListener('change', function () {
+    // Whole word has no meaning for a pattern the user wrote themselves
+    findWord.disabled = findRegex.checked;
+    if (findRegex.checked) findWord.checked = false;
+    runFind(true);
+  });
+  findScope.addEventListener('change', function () {
+    if (findScope.checked && !findScopeRange) {
+      findScope.checked = false;
+      flashFindHint('Select some text in the editor first, then press Ctrl+F', 2600);
+      return;
+    }
+    showFindHint();
+    runFind(true);
+  });
   findPrevBtn.addEventListener('click', function () { gotoFind(-1); });
   findNextBtn.addEventListener('click', function () { gotoFind(1); });
   replaceBtn.addEventListener('click', replaceCurrent);
