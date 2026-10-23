@@ -925,7 +925,9 @@
   var scanFontsBtn = document.getElementById('scanFontsBtn');
   var loadingInd = document.getElementById('loadingInd');
   var FONTS_CACHE_KEY = 'simpleEditor.fonts'; // cached family names, survives restarts
+  var FONT_STATS_KEY = 'simpleEditor.fontStats'; // tiny { families, faces } summary for the button title
   var pendingSystemFonts = null; // cached families awaiting LAZY build (avoids the startup rebuild)
+  var FONT_COLLATOR = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
 
   // Turn the busy feedback on/off: hourglass over the whole page + the blinking
   // "Loading" chip next to the color buttons. Used by any long-running op.
@@ -934,8 +936,15 @@
     if (loadingInd) loadingInd.classList.toggle('show', !!on);
   }
 
-  function cacheFonts(families) {
+  // Only the deduped family list is cached: it is all the dropdown needs, and
+  // it parses in a couple of milliseconds even for thousands of families.
+  // (A full per-face catalog is not stored — nothing read it, and cloning tens
+  // of thousands of face records on every launch was pure startup cost.)
+  function cacheFonts(families, faceCount) {
     try { localStorage.setItem(FONTS_CACHE_KEY, JSON.stringify(families)); } catch (e) {}
+    try {
+      localStorage.setItem(FONT_STATS_KEY, JSON.stringify({ families: families.length, faces: faceCount || 0 }));
+    } catch (e) {}
   }
 
   function readFontsCache() {
@@ -945,44 +954,19 @@
     } catch (e) { return null; }
   }
 
-  // ---- Full-catalog cache in IndexedDB ----
-  // localStorage only keeps the compact, deduped FAMILY list. To enlist the
-  // ENTIRE font set (every face/style/full/PostScript name) — which can be
-  // humongous for a huge library — we persist it to IndexedDB, whose storage
-  // quota is far larger than localStorage's ~5MB. The family list stays in
-  // localStorage purely so the dropdown can hydrate instantly on next load.
-  var FONTDB_NAME = 'simpleEditor.fontdb', FONTDB_STORE = 'kv';
-  var allFaces = null; // in-memory mirror of the full catalog for this session
-
-  function idbWrite(value) {
-    try {
-      var req = indexedDB.open(FONTDB_NAME, 1);
-      req.onupgradeneeded = function () { req.result.createObjectStore(FONTDB_STORE); };
-      req.onsuccess = function () {
-        var db = req.result;
-        var tx = db.transaction(FONTDB_STORE, 'readwrite');
-        tx.objectStore(FONTDB_STORE).put(value, 'faces');
-        tx.oncomplete = function () { db.close(); };
-      };
-      req.onerror = function () { /* IDB unavailable; localStorage families still work */ };
-    } catch (e) { /* indexedDB missing (private mode etc.) — degrade silently */ }
+  function readFontStats() {
+    try { return JSON.parse(localStorage.getItem(FONT_STATS_KEY)) || null; } catch (e) { return null; }
   }
 
-  function idbReadFaces(cb) {
-    try {
-      var req = indexedDB.open(FONTDB_NAME, 1);
-      req.onupgradeneeded = function () { req.result.createObjectStore(FONTDB_STORE); };
-      req.onsuccess = function () {
-        var db = req.result;
-        var get = db.transaction(FONTDB_STORE, 'readonly').objectStore(FONTDB_STORE).get('faces');
-        get.onsuccess = function () { cb(get.result || null); db.close(); };
-        get.onerror = function () { cb(null); db.close(); };
-      };
-      req.onerror = function () { cb(null); };
-    } catch (e) { cb(null); }
-  }
+  // Per-option font families make the native dropdown render a face per row.
+  // Past a thousand families that costs seconds, so big libraries list their
+  // names in the standard UI font — and are built in chunks instead.
+  var FONT_PREVIEW_LIMIT = 1000;
 
-  function populateSystemFonts(families) {
+  var FONT_BUILD_CHUNK = 400; // options added per tick while building a huge list
+  var fontBuild = null;       // in-flight chunked build of the system-font list
+
+  function systemFontGroup() {
     var group = document.getElementById('sysFontGroup');
     if (!group) {
       group = document.createElement('optgroup');
@@ -990,19 +974,31 @@
       group.label = 'System fonts';
       fontFamily.appendChild(group);
     }
-    var saved = defaultFont;
+    return group;
+  }
+
+  function makeFontOption(family, styled) {
+    var cssVal = '"' + family + '", sans-serif';
+    var opt = document.createElement('option');
+    opt.value = cssVal;
+    opt.textContent = family;
+    if (styled) opt.style.fontFamily = cssVal; // preview in its own typeface
+    return opt;
+  }
+
+  function appendFontOptions(build, count) {
     var frag = document.createDocumentFragment();
-    families.forEach(function (f) {
-      var cssVal = '"' + f + '", sans-serif';
-      var opt = document.createElement('option');
-      opt.value = cssVal;
-      opt.textContent = f;
-      opt.style.fontFamily = cssVal; // preview each option in its own typeface
-      frag.appendChild(opt);
-    });
-    group.innerHTML = '';
-    group.appendChild(frag); // one batched insert instead of thousands of reflows
+    var end = Math.min(build.index + count, build.families.length);
+    for (; build.index < end; build.index++) {
+      frag.appendChild(makeFontOption(build.families[build.index], build.styled));
+    }
+    build.group.appendChild(frag); // one batched insert per chunk
+    return build.index >= build.families.length;
+  }
+
+  function syncSystemFontSelection(families) {
     // If the current font matches a discovered family, sync the dropdown to it
+    var saved = defaultFont;
     var match = families.filter(function (f) {
       return saved && saved.toLowerCase().indexOf(f.toLowerCase()) !== -1;
     })[0];
@@ -1013,17 +1009,73 @@
     }
   }
 
-  // Build the (potentially enormous) System fonts list only when it's first
-  // needed, so opening the app stays instant. After the first Font-menu open,
-  // the list is fully built and cached in the DOM for the rest of the session.
-  function ensureSystemFontsLoaded() {
+  function cancelFontBuild() {
+    if (!fontBuild) return;
+    clearTimeout(fontBuild.timer);
+    fontBuild = null;
+  }
+
+  // Add the remaining options right away — used when the menu opens mid-build
+  function finishFontBuild() {
+    var build = fontBuild;
+    if (!build) return;
+    clearTimeout(build.timer);
+    appendFontOptions(build, build.families.length);
+    fontBuild = null;
+    syncSystemFontSelection(build.families);
+  }
+
+  function populateSystemFonts(families, sync) {
+    cancelFontBuild();
+    var group = systemFontGroup();
+    group.innerHTML = '';
+    var build = {
+      families: families,
+      index: 0,
+      group: group,
+      styled: families.length <= FONT_PREVIEW_LIMIT,
+      timer: 0
+    };
+    // sync = the dropdown is about to open: it must be complete right now
+    if (sync || families.length <= FONT_PREVIEW_LIMIT) {
+      appendFontOptions(build, families.length);
+      syncSystemFontSelection(families);
+      return;
+    }
+    // Huge library: feed the select in small chunks so the page never freezes
+    fontBuild = build;
+    var step = function () {
+      if (fontBuild !== build) return;
+      if (appendFontOptions(build, FONT_BUILD_CHUNK)) {
+        fontBuild = null;
+        syncSystemFontSelection(families);
+      } else {
+        build.timer = setTimeout(step, 0);
+      }
+    };
+    step();
+  }
+
+  function ensureSystemFontsLoaded(sync) {
+    if (fontBuild) { finishFontBuild(); return; }
     if (!pendingSystemFonts) return;
     var list = pendingSystemFonts;
     pendingSystemFonts = null;
-    populateSystemFonts(list);
+    populateSystemFonts(list, sync);
   }
-  fontFamily.addEventListener('mousedown', ensureSystemFontsLoaded);
-  fontFamily.addEventListener('focus', ensureSystemFontsLoaded);
+  fontFamily.addEventListener('mousedown', function () { ensureSystemFontsLoaded(true); });
+  fontFamily.addEventListener('focus', function () { ensureSystemFontsLoaded(true); });
+
+  // Warm the list up once the page is idle, so the first Font-menu open does
+  // not have to build thousands of options as the dropdown opens
+  function scheduleSystemFontsBuild() {
+    if (!pendingSystemFonts) return;
+    if (window.requestIdleCallback) {
+      window.requestIdleCallback(function () { ensureSystemFontsLoaded(false); }, { timeout: 1500 });
+    } else {
+      setTimeout(function () { ensureSystemFontsLoaded(false); }, 900);
+    }
+  }
 
   scanFontsBtn.addEventListener('click', function () {
     if (!window.queryLocalFonts) {
@@ -1038,23 +1090,17 @@
       // Let the Loading chip paint (and the permission prompt settle) before the
       // heavy dedupe/populate work blocks the main thread
       requestAnimationFrame(function () {
-      var seen = {}, families = [];
+      var seen = new Set(), families = [];
       fonts.forEach(function (f) {
-        if (!seen[f.family]) { seen[f.family] = 1; families.push(f.family); }
+        if (!seen.has(f.family)) { seen.add(f.family); families.push(f.family); }
       });
-      families.sort(function (a, b) { return a.localeCompare(b); });
+      families.sort(FONT_COLLATOR.compare);
       populateSystemFonts(families);
       pendingSystemFonts = null; // freshly built from the scan; nothing to lazy-load
-      cacheFonts(families); // next launch loads instantly from cache
-      // Enlist the ENTIRE catalog (every face, not just deduped families) into
-      // IndexedDB — kept regardless of how large it gets.
-      allFaces = fonts.map(function (f) {
-        return { family: f.family, style: f.style, fullName: f.fullName, postscriptName: f.postscriptName };
-      });
-      idbWrite(allFaces);
+      cacheFonts(families, fonts.length); // next launch loads instantly from cache
       scanFontsBtn.textContent = '🔤 ' + families.length;
       scanFontsBtn.classList.add('scanned');
-      scanFontsBtn.title = families.length + ' families (' + allFaces.length + ' faces) cached — click to rescan after installing new fonts';
+      scanFontsBtn.title = families.length + ' families (' + fonts.length + ' faces) cached — click to rescan after installing new fonts';
       status.textContent = 'Saved';
       setBusy(false);
       });
@@ -2070,19 +2116,15 @@
   (function hydrateFontCache() {
     var cached = readFontsCache();
     if (!cached) return;
-    // Don't rebuild the huge option list at startup — stash it and build lazily
-    // on the first Font-menu open, so every subsequent app open is instant.
+    // Stash the families and build the option list during idle time, so the
+    // app opens instantly and the first Font-menu open is already populated
     pendingSystemFonts = cached;
     scanFontsBtn.textContent = '🔤 ' + cached.length;
     scanFontsBtn.classList.add('scanned');
-    scanFontsBtn.title = cached.length + ' families cached — the list fills the first time you open the Font menu';
-    // Restore the ENTIRE face catalog (if stored) into memory for this session
-    idbReadFaces(function (faces) {
-      if (Array.isArray(faces) && faces.length) {
-        allFaces = faces;
-        scanFontsBtn.title = cached.length + ' families (' + faces.length + ' faces) cached — the list fills the first time you open the Font menu';
-      }
-    });
+    var stats = readFontStats();
+    var faces = stats && stats.faces ? ' (' + stats.faces + ' faces)' : '';
+    scanFontsBtn.title = cached.length + ' families' + faces + ' cached — click to rescan after installing new fonts';
+    scheduleSystemFontsBuild();
   })();
 
   editor.focus();
