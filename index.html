@@ -959,8 +959,8 @@
   }
 
   // Per-option font families make the native dropdown render a face per row.
-  // Past a thousand families that costs seconds, so big libraries list their
-  // names in the standard UI font — and are built in chunks instead.
+  // Past a thousand families that costs seconds, so big libraries preview the
+  // first thousand alphabetically and list the rest in the standard UI font.
   var FONT_PREVIEW_LIMIT = 1000;
 
   var FONT_BUILD_CHUNK = 400; // options added per tick while building a huge list
@@ -990,7 +990,8 @@
     var frag = document.createDocumentFragment();
     var end = Math.min(build.index + count, build.families.length);
     for (; build.index < end; build.index++) {
-      frag.appendChild(makeFontOption(build.families[build.index], build.styled));
+      // Only the first thousand families pay the per-row typeface cost
+      frag.appendChild(makeFontOption(build.families[build.index], build.index < FONT_PREVIEW_LIMIT));
     }
     build.group.appendChild(frag); // one batched insert per chunk
     return build.index >= build.families.length;
@@ -1033,7 +1034,6 @@
       families: families,
       index: 0,
       group: group,
-      styled: families.length <= FONT_PREVIEW_LIMIT,
       timer: 0
     };
     // sync = the dropdown is about to open: it must be complete right now
